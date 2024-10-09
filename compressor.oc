@@ -1,0 +1,215 @@
+import std::libc::{ exit, system }
+import std::shift_args
+import std::fs
+import std::buffer::Buffer
+import std::heap::Heap
+import std::mem
+import std::map::Map
+import std::bitio::{ BitWriter, BitReader }
+import std::sv::SV
+
+enum Mode {
+    Compress
+    Decompress
+    None
+}
+
+def usage(code: i32, full: bool) {
+    println("Usage:")
+    println("   ./huffman <-c|-d> -i <path> -o <path>")
+    if not full then exit(code)
+
+    println("--------------------------------------------------------")
+    println("Compile Options:")
+    println("    -i path        Input path")
+    println("    -o path        Output path")
+    println("    -c             Compress")
+    println("    -d             Decompress")
+    println("    -h             Display this information")
+    exit(code)
+}
+
+let mode: Mode = None
+let input: str = "/dev/stdin"
+let output: str = "/dev/stdout"
+
+
+def parse_args(argc: &i32, argv: &&str) {
+    while *argc > 0 {
+        let arg = shift_args(argc, argv)
+        match arg {
+            "--help" => usage(code: 0, true)
+            "-i" | "--input" => input = shift_args(argc, argv)
+            "-o" | "--output" => output = shift_args(argc, argv)
+            "-c" | "--compress" => mode = Compress
+            "-d" | "--decompress" => mode = Decompress
+            else => {
+                println("Unknown option/argument: '%s'", arg)
+                usage(code: 1, true)
+            }
+        }
+    }
+
+    if mode == None {
+        println("Mode was not selected. Please choose -c or -d")
+        usage(code: 1, true)
+    }
+}
+
+enum NodeType {
+    Tree
+    Char
+}
+
+struct Node {
+    type: NodeType
+    freq: u32
+    chr: char
+    left: &Node
+    right: &Node
+}
+
+def Node::from_char(chr: char, freq: u32): &Node {
+    let node = mem::alloc<Node>()
+    node.chr = chr
+    node.freq = freq
+    node.type = Char
+    return node
+}
+
+def Node::from_node(a: &Node, b: &Node): &Node {
+    let node = mem::alloc<Node>()
+    node.left = a
+    node.right = b
+    node.freq = a.freq + b.freq
+    node.type = Tree
+    return node
+}
+
+def Node::compare(&this, other: &Node): i8 => .freq.compare(other.freq)
+
+def print_tree(node: &Node, state: str, idx: u32) {
+    if node.type == Char {
+        state[idx] = '\0'
+        println(f"{node.chr} -> {state}")
+    }
+    else {
+        state[idx] = '0'
+        print_tree(node.left, state, idx + 1)
+        state[idx] = '1'
+        print_tree(node.right, state, idx + 1)
+    }
+}
+
+def generate_codes(node: &Node, code: str, idx: u32, codes: &Map<char, SV>) {
+    if node.type == Char {
+        code[idx] = '\0'
+        codes.insert(node.chr, SV(code.copy(), code.len()))
+    } else {
+        code[idx] = '0'
+        generate_codes(node.left, code, idx + 1, codes)
+        code[idx] = '1'
+        generate_codes(node.right, code, idx + 1, codes)
+    }
+}
+
+def encode_tree(bitwriter: &BitWriter, node: &Node) {
+    if node.type == Char {
+        bitwriter.write_bit(0)
+        bitwriter.write_u8(node.chr as u8)
+    } else {
+        bitwriter.write_bit(1)
+        encode_tree(bitwriter, node.right)
+        encode_tree(bitwriter, node.left)
+    }
+}
+
+def compress(file: &Buffer): Buffer {
+    let sv = file.sv()
+    let counts: [u32;256]
+
+    for c in sv.chars() {
+        counts[c as u8] += 1
+    }
+
+    let heap = Heap<&Node>::new(Min)
+
+    for let i = 0; i < 256; i++ {
+        if counts[i] > 0 {
+            heap.push(Node::from_char(i as char, counts[i]))
+        }
+    }
+
+    while heap.size() > 1 {
+        heap.push(Node::from_node(heap.pop(), heap.pop()))
+    }
+
+    let root = heap.pop()
+    let codes = Map<char, SV>::new()
+    let code = Buffer::make(128)
+    generate_codes(root, code.str(), 0, codes)
+    
+    let compressed = Buffer::make(sv.len / 2)
+    compressed.write_u32(sv.len)
+    let bitwriter = BitWriter::make(&compressed)
+
+    encode_tree(&bitwriter, root)
+
+    for c in sv.chars() {
+        let code = codes[c]
+        for bit in codes[c].chars() {
+            bitwriter.write_bit(bit.get_digit() as u8)
+        }
+    }
+    bitwriter.finish()
+    return compressed
+}
+
+def sig_reader(bitreader: &BitReader): &Node => match bitreader.read_bit() {
+    0 => Node::from_char(bitreader.read_u8() as char, 0)
+    else => Node::from_node(
+        sig_reader(bitreader),
+        sig_reader(bitreader)
+    )
+}
+
+def read_char(bitreader: &BitReader, node: &Node): char {
+    if node.type == Char {
+        return node.chr
+    } else {
+        return match bitreader.read_bit() {
+            0 => read_char(bitreader, node.left)
+            else => read_char(bitreader, node.right)
+        }
+    }
+}
+
+def decompress(file: &Buffer): Buffer {
+    let bytesreader = file.reader()
+    let output_len = bytesreader.read_u32()
+
+    let bitreader = BitReader::from_sv(file.sv().skip(4))
+    let root = sig_reader(&bitreader)
+
+    let decompressed = Buffer::make(output_len)
+    while decompressed.size < output_len {
+        decompressed += read_char(&bitreader, root)
+    }
+
+    return decompressed
+}
+
+
+def main(argc: i32, argv: &str) {
+    shift_args(&argc, &argv)
+    parse_args(&argc, &argv)
+    let file = fs::read_file(input)
+
+    let data = match mode {
+        Compress => compress(&file)
+        Decompress => decompress(&file)
+        else => std::panic("unreachable")
+    }
+
+    fs::write_file(output, data)
+}
